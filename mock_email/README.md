@@ -1,27 +1,51 @@
 ## mock_email
 
-A tiny **mock email service** for local development and integration tests. It accepts “send email” requests, applies simple quota/rate-limit constraints, and returns deterministic responses (no real email is delivered).
+A tiny **mock email service** for local development and integration tests. It accepts "send email" requests, applies a simple in-memory rate limit, and returns accepted responses without delivering real email.
 
-### Goals / constraints
+### Current status
 
-This service is intended to enforce **three limits**:
+Implemented:
 
-- **Burst**: max **10 requests / second**
-- **Sustained**: max **100 requests / minute**
-- **Daily**: max **10,000 messages / day**
+- `GET /health` returns a simple health payload.
+- `POST /send` accepts a mock email request and returns `202 Accepted`.
+- Basic in-memory token-bucket rate limiting is applied before accepting a send.
 
-Notes:
-- Limits are intended to be enforced **per client** (typically by IP or an API key), and should be configurable later if needed.
-- “Requests” and “messages” are treated equivalently here (1 request = 1 email message) unless you later add batching.
+Not implemented:
 
-### Current status (in repo today)
+- Real email delivery.
+- Daily quotas.
+- Per-client or per-API-key rate limits.
+- Distributed/shared rate limiting across workers or service instances.
+- Server-side idempotency handling.
+- Containerization; `Dockerfile` is currently empty.
 
-- Implemented:
-  - `GET /health` → returns a simple “ok” payload
-- Not implemented yet (but this README defines the intended contract):
-  - A “send email” endpoint (suggested below)
-  - Rate limiting / quota enforcement (placeholder file `app/rate_limiter.py` is currently empty)
-  - Containerization (the `Dockerfile` is currently empty)
+### Rate limits
+
+The current limiter is configured from `EMAIL__REQUEST_PER_MINUTE` and `EMAIL__BURST_PER_SECOND`, with defaults of:
+
+- **Burst capacity**: `10`
+- **Refill rate**: `100 / minute`
+
+Important limitations:
+
+- The limiter is process-local and stored in memory.
+- The limiter is global for the whole service, not scoped by IP address, user, tenant, or API key.
+- Limits reset when the process restarts.
+- Multiple Uvicorn/Gunicorn workers would each have their own independent limiter.
+- It uses a token-bucket approximation, not a sliding window log.
+- Daily quota enforcement is not implemented.
+- `Retry-After` is currently a fixed value from the error type, not a precise wait time from the bucket state.
+- One request is treated as one message, regardless of recipient count.
+
+### Future direction
+
+Planned improvements:
+
+- Add daily quotas, for example `10,000` accepted messages per day.
+- Replace or supplement the current token bucket with a sliding window log algorithm.
+- Move rate-limit state to Redis so limits are shared across workers and instances.
+- Enforce rate limits per API key.
+- Keep API keys mock-only: callers can provide arbitrary UUIDs or random strings. No API key generation or management logic is required for this service.
 
 ### API
 
@@ -40,8 +64,6 @@ Response (example):
 
 #### Send email (intended)
 
-Suggested endpoint:
-
 `POST /send`
 
 Request body (example):
@@ -50,39 +72,37 @@ Request body (example):
 {
   "to": ["user@example.com"],
   "subject": "Welcome!",
-  "text": "Hello from the mock email service",
-  "html": "<p>Hello from the mock email service</p>",
-  "headers": {
-    "X-Correlation-Id": "abc-123"
-  }
+  "body": "Hello from the mock email service",
+  "idempotency_key": "8abf9d35-bb8c-4c54-9de0-c3d67fd56b0d"
 }
 ```
+
+`idempotency_key` is accepted as client-owned metadata only. The mock email service does not de-duplicate requests, replay previous responses, or enforce idempotency. Clients that need idempotent behavior should store and enforce it on their side.
 
 Success response (example):
 
 ```json
 {
   "status": "accepted",
-  "message_id": "mock_01J0...etc",
+  "message_id": "8e417e91-eeec-4771-a35d-e7416e6ca8c2",
   "accepted_at": "2026-05-09T10:00:00Z"
 }
 ```
 
-Rate limit responses (intended):
+Rate limit responses:
 
-- **429 Too Many Requests** when burst/sustained limits are exceeded
-- **403 Forbidden** (or **429**) when daily quota is exhausted
+- **429 Too Many Requests** when the current token bucket is exhausted.
 
 Error body (example):
 
 ```json
 {
-  "status": "rejected",
-  "reason": "rate_limited",
-  "limit": "10_req_per_sec",
-  "retry_after_seconds": 1
+  "status": "error",
+  "message": "Rate limit exceeded"
 }
 ```
+
+The response also includes a `Retry-After` header.
 
 ### Running locally
 
@@ -101,5 +121,6 @@ curl -sS localhost:8001/health
 ### Integration notes
 
 - **No delivery**: this service should never send real emails.
-- **Deterministic behavior**: keep responses stable so tests don’t flake.
+- **Client-owned idempotency**: callers are responsible for de-duplicating retries if their workflow requires it.
+- **Mock API keys later**: when per-key limits are added, use caller-supplied UUIDs or random strings as API keys.
 - **Observability (optional later)**: it’s often useful to log accepted/rejected sends with a correlation id and emit simple counters (accepted / rate_limited / daily_quota_exceeded).
