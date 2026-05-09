@@ -6,6 +6,7 @@ from app.core.config import config
 
 from app.schemas import SendEmailRequest, SendEmailResponse
 from app.provider import get_provider, MockEmailProvider
+from app.rate_limiter import get_rate_limiter, RateLimiter
 
 app = FastAPI(
     title="Mock Email Service",
@@ -35,7 +36,10 @@ async def health():
 
 @app.post("/send", status_code=status.HTTP_202_ACCEPTED)
 async def send(
-    request: SendEmailRequest, provider: MockEmailProvider = Depends(get_provider)
+    request: SendEmailRequest,
+    provider: MockEmailProvider = Depends(get_provider),
+    rate_limiter: RateLimiter = Depends(get_rate_limiter),
 ) -> SendEmailResponse:
+    await rate_limiter.check()
     response = await provider.send(request.to, request.subject, request.body)
     return SendEmailResponse(**response)
